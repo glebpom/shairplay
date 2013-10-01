@@ -70,6 +70,11 @@ AM_CONDITIONAL([OS_FREEBSD],[test "$os_freebsd" = "yes"])
 PKG_CHECK_MODULES([libao], [ao >= 1.1.0], [have_libao=1], [have_libao=0])
 AM_CONDITIONAL([HAVE_LIBAO], [test "$have_libao" -eq 1])
 
+dnl Check for JACK
+PKG_CHECK_MODULES(JACK, jack >= 0.99.14, with_jack=yes, with_jack=no)
+AC_SUBST(JACK_CFLAGS)
+AC_SUBST(JACK_LIBS)
+AM_CONDITIONAL(HAVE_JACK, test x$with_jack = xyes)
 
 
 AC_CONFIG_FILES(
