@@ -37,10 +37,16 @@
 #include <shairplay/dnssd.h>
 #include <shairplay/raop.h>
 
-#include <ao/ao.h>
 #include <jack/jack.h>
+#include <jack/ringbuffer.h>
+
 
 #include "config.h"
+
+
+
+#define max(x,y) (((x)>(y)) ? (x) : (y))
+#define min(x,y) (((x)<(y)) ? (x) : (y))
 
 typedef struct {
 	char apname[56];
@@ -48,30 +54,18 @@ typedef struct {
 	unsigned short port;
 	char hwaddr[6];
 
-	char ao_driver[56];
-	char ao_devicename[56];
-	char ao_deviceid[16];
 } shairplay_options_t;
 
 typedef struct {
-	ao_device *device;
-
-	int buffering;
-	int buflen;
-
-	int write_position;
-	int read_position;
-
-	char buffer[8192];
-
 	float volume;
+
 } shairplay_session_t;
+
+jack_ringbuffer_t *rb;
 
 jack_port_t *jack_output_port1, *jack_output_port2;
 jack_client_t *jack_client;
 
-char tmpbuf[8196];
-int tmpbuflen;
 
 static int running;
 
@@ -130,6 +124,19 @@ parse_hwaddr(const char *str, char *hwaddr, int hwaddrlen)
 	return 0;
 }
 
+#define SAMPLE_MAX_16BIT  32768.0f
+
+void sample_move_dS_s16(jack_default_audio_sample_t* dst, char *src, jack_nframes_t nsamples, unsigned long src_skip) 
+{
+	/* ALERT: signed sign-extension portability !!! */
+	while (nsamples--) {
+		*dst = (*((short *) src)) / SAMPLE_MAX_16BIT;
+		dst++;
+		src += src_skip;
+	}
+}	
+
+
 /**
  * The process callback for this JACK application is called in a
  * special realtime thread once for each audio cycle.
@@ -141,40 +148,66 @@ parse_hwaddr(const char *str, char *hwaddr, int hwaddrlen)
 int
 process (jack_nframes_t nframes, void *arg)
 {   
-     shairplay_session_t *session = (shairplay_session_t*)arg;
-	 jack_default_audio_sample_t *out1, *out2;
+    shairplay_session_t *session = (shairplay_session_t*)arg;
+//	shairplay_session_t *session = arg;
+
+	jack_default_audio_sample_t *out1, *out2;
 	
-	 out1 = (jack_default_audio_sample_t*)jack_port_get_buffer (jack_output_port1, nframes);
-	 out2 = (jack_default_audio_sample_t*)jack_port_get_buffer (jack_output_port2, nframes);
+	out1 = (jack_default_audio_sample_t*)jack_port_get_buffer (jack_output_port1, nframes);
+	out2 = (jack_default_audio_sample_t*)jack_port_get_buffer (jack_output_port2, nframes);
 
-     int i = 0;
-     int min_size; 
-     int tj = 0;
-     int maxsize = nframes;
-     tmpbuflen = 0;
+	jack_nframes_t nframes_left = nframes;
+//	short tmp[2];
+//	int nframe = 0;
+	int wrotebytes = 0;
 
-     char tmp[8192];
 
-     int length = 0;
-     int position = 0;
- 	 for (position = session->read_position; position < session->read_position + 8192; position++){
-		printf("position = %d, write_position = %d\n", position, session->write_position);
- 	 	if (position == session->write_position) {
- 	 		break;
- 	 	};
- 	 	tmp[i++] = session->buffer[position%8192];
- 	 	length++;
- 	 }
-	 session->read_position = (session->read_position + length) % 8192;
+//	printf("nframes_left = %d, space = %d\n", nframes_left, jack_ringbuffer_read_space(rb));
 
- 	 for (i=0;i<length/4; i++){
- 	 	short *tmpshort = (unsigned short *)&tmp[i*4];
-     	out1[i] = tmpshort[0] / 32767.0;
-     	out2[i] = tmpshort[1] / 32767.0;
-
-	 } 
+	if (jack_ringbuffer_read_space(rb) == 0) {
     
-	return 0;      
+		// just write silence
+		memset(out1, 0, nframes * sizeof(jack_default_audio_sample_t));
+		memset(out2, 0, nframes * sizeof(jack_default_audio_sample_t));	
+	} else {
+	// 	while (jack_ringbuffer_read_space(rb) >= 4 && nframes_left > 0) { //if there is a free space to write and 4 bytes in buffer exist
+	// 		jack_ringbuffer_read(rb, (void *)&tmp, 4);
+	// 		out1[nframe] = tmp[0] / 32767.0;
+	// 		out2[nframe] = tmp[1] / 32767.0;
+	// 		nframe++;
+	// 		nframes_left--;
+	// //W		jack_ringbuffer_read_advance(rb, 4);
+	// 	}
+
+	  jack_ringbuffer_data_t rb_data[2];
+
+			jack_ringbuffer_get_read_vector(rb, rb_data);
+			
+			while (nframes_left > 0 && rb_data[0].len > 4) {
+		
+				jack_nframes_t towrite_frames = (rb_data[0].len) / (sizeof(short) * 2);
+				towrite_frames = min(towrite_frames, nframes_left);
+			
+				sample_move_dS_s16(out1 + (nframes - nframes_left), (char *) rb_data[0].buf, towrite_frames, sizeof(short) * 2);
+				sample_move_dS_s16(out2 + (nframes - nframes_left), (char *) rb_data[0].buf + sizeof(short), towrite_frames, sizeof(short) * 2);
+
+
+				wrotebytes = towrite_frames * sizeof(short) * 2;
+				nframes_left -= towrite_frames;
+				
+				jack_ringbuffer_read_advance(rb, wrotebytes);
+				jack_ringbuffer_get_read_vector(rb, rb_data);
+			}
+
+			if (nframes_left > 0) {
+				// write silence
+				memset(out1 + (nframes - nframes_left), 0, (nframes_left) * sizeof(jack_default_audio_sample_t));
+				memset(out2 + (nframes - nframes_left), 0, (nframes_left) * sizeof(jack_default_audio_sample_t));		
+			}
+
+	}
+
+	return 0;
 }
 
 /**
@@ -188,57 +221,30 @@ jack_shutdown (void *arg)
 }
 
 
-static ao_device *
-audio_open_device(shairplay_options_t *opt, int bits, int channels, int samplerate)
-{
-	ao_device *device = NULL;
-	ao_option *ao_options = NULL;
-	ao_sample_format format;
-	int driver_id;
-
-	/* Get the libao driver ID */
-	if (strlen(opt->ao_driver)) {
-		driver_id = ao_driver_id(opt->ao_driver);
-	} else {
-		driver_id = ao_default_driver_id();
-	}
-
-	/* Add all available libao options */
-	if (strlen(opt->ao_devicename)) {
-		ao_append_option(&ao_options, "dev", opt->ao_devicename);
-	}
-	if (strlen(opt->ao_deviceid)) {
-		ao_append_option(&ao_options, "id", opt->ao_deviceid);
-	}
-
-	/* Set audio format */
-	memset(&format, 0, sizeof(format));
-	format.bits = bits;
-	format.channels = channels;
-	format.rate = samplerate;
-	format.byte_format = AO_FMT_NATIVE;
-
-	/* Try opening the actual device */
-	device = ao_open_live(driver_id, &format, ao_options);
-	ao_free_options(ao_options);
-	return device;
-}
 
 static void *
 audio_init(void *cls, int bits, int channels, int samplerate)
 {
-	shairplay_options_t *options = cls;
 	shairplay_session_t *session;
-
-	session = calloc(1, sizeof(shairplay_session_t));
-	assert(session);
-
+	shairplay_options_t *options = cls;
 
 	const char **ports;
 	const char *client_name = "shairplay";
 	const char *server_name = NULL;
 	jack_options_t jack_options = JackNullOption;
 	jack_status_t jack_status;
+
+	printf("Size of shairplay session = %d\n", sizeof(shairplay_session_t));
+	session = calloc(1, sizeof(shairplay_session_t));
+	assert(session);
+
+	session->volume = 1.0f;
+
+	rb = jack_ringbuffer_create(65536);
+
+	printf("rb pointer = %p\n", rb);
+
+	memset(rb->buf, 0, rb->size);
 
 
 	jack_client = jack_client_open (client_name, jack_options, &jack_status, server_name);
@@ -318,8 +324,6 @@ audio_init(void *cls, int bits, int channels, int samplerate)
 	}
 
 	jack_free (ports);
-
-	jack_set_buffer_size(jack_client, sizeof(tmpbuf)/sizeof(jack_nframes_t));
     
     /* install a signal handler to properly quits jack client */
 // #ifdef WIN32
@@ -335,35 +339,7 @@ audio_init(void *cls, int bits, int channels, int samplerate)
 	//---jack---
 	fprintf(stderr, "Jack initialized\n");
 
-
-	session->device = audio_open_device(options, bits, channels, samplerate);
-	if (session->device == NULL) {
-		printf("Error opening device %d\n", errno);
-	}
-	assert(session->device);
-
-	session->buffering = 1;
-	session->volume = 1.0f;
-	session->write_position = 0;
-	session->read_position = 0;
 	return session;
-}
-
-static int
-audio_output(shairplay_session_t *session, const void *buffer, int buflen)
-{
-	short *shortbuf;
-	int i;
-
-	tmpbuflen = (buflen > sizeof(tmpbuf)) ? sizeof(tmpbuf) : buflen;
-	memcpy(tmpbuf, buffer, tmpbuflen);
-
-	shortbuf = (short *)tmpbuf;
-	for (i=0; i<tmpbuflen/2; i++) {
-		shortbuf[i] = shortbuf[i] * session->volume;
-	}
-//	ao_play(session->device, tmpbuf, tmpbuflen);
-	return tmpbuflen;
 }
 
 
@@ -371,47 +347,8 @@ static void
 audio_process(void *cls, void *opaque, char *buffer, int buflen)
 {
 	shairplay_session_t *session = opaque;
-	int processed;
 
-	//постоянно записываем аудио в кольцевой буффер
-
-	int position; 
-	int i=0;
-	for (position = session->write_position; position < session->write_position + buflen; position++){
-		session->buffer[position % 8192] = buffer[i++];
-	}
-	session->write_position = (session->write_position + buflen) % 8192;
-	fprintf(stderr, "new position = %d\n", session->write_position);
-
-
-	// if (session->buffering) {
-	// 	//buffering = 1 только в самом начале
-	// 	printf("Buffering...\n");
-	// 	if (session->buflen+buflen < sizeof(session->buffer)) {
-	// 		//дописываем в буфер новые данные
-	// 		memcpy(session->buffer+session->buflen, buffer, buflen);
-	// 		session->buflen += buflen;
-	// 		return;
-	// 	}
-	// 	//помечаем, что дописали
-	// 	session->buffering = 0;
-	// 	printf("Finished buffering...\n");
-
-	// 	processed = 0;
-	// 	while (processed < session->buflen) {
-	// 		processed += audio_output(session,
-	// 		                          session->buffer+processed,
-	// 		                          session->buflen-processed);
-	// 	}
-	// 	session->buflen = 0;
-	// }
-
-	// processed = 0;
-	// while (processed < buflen) {
-	// 	processed += audio_output(session,
-	// 	                          buffer+processed,
-	// 	                          buflen-processed);
-	// }
+	jack_ringbuffer_write (rb, (void *) (buffer), buflen);
 
 }
 
@@ -420,7 +357,6 @@ audio_destroy(void *cls, void *opaque)
 {
 	shairplay_session_t *session = opaque;
 
-	ao_close(session->device);
 	free(session);
 }
 
@@ -463,12 +399,6 @@ parse_options(shairplay_options_t *opt, int argc, char *argv[])
 				fprintf(stderr, "Please use hwaddr format: 01:45:89:ab:cd:ef\n");
 				return 1;
 			}
-		} else if (!strncmp(arg, "--ao_driver=", 12)) {
-			strncpy(opt->ao_driver, arg+12, sizeof(opt->ao_driver)-1);
-		} else if (!strncmp(arg, "--ao_devicename=", 16)) {
-			strncpy(opt->ao_devicename, arg+16, sizeof(opt->ao_devicename)-1);
-		} else if (!strncmp(arg, "--ao_deviceid=", 14)) {
-			strncpy(opt->ao_deviceid, arg+14, sizeof(opt->ao_deviceid)-1);
 		} else if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
 			fprintf(stderr, "Shairplay version %s\n", VERSION);
 			fprintf(stderr, "Usage: %s [OPTION...]\n", path);
@@ -477,9 +407,6 @@ parse_options(shairplay_options_t *opt, int argc, char *argv[])
 			fprintf(stderr, "  -p, --password=secret           Sets password\n");
 			fprintf(stderr, "  -o, --server_port=5000          Sets port for RAOP service\n");
 			fprintf(stderr, "      --hwaddr=address            Sets the MAC address, useful if running multiple instances\n");
-			fprintf(stderr, "      --ao_driver=driver          Sets the ao driver (optional)\n");
-			fprintf(stderr, "      --ao_devicename=devicename  Sets the ao device name (optional)\n");
-			fprintf(stderr, "      --ao_deviceid=id            Sets the ao device id (optional)\n");
 			fprintf(stderr, "  -h, --help                      This help\n");
 			fprintf(stderr, "\n");
 			return 1;
@@ -497,7 +424,6 @@ int
 main(int argc, char *argv[])
 {
 	shairplay_options_t options;
-	ao_device *device = NULL;
 
 	dnssd_t *dnssd;
 	raop_t *raop;
@@ -515,18 +441,6 @@ main(int argc, char *argv[])
 		return 0;
 	}
 
-
-	ao_initialize();
-
-	device = audio_open_device(&options, 16, 2, 44100);
-	if (device == NULL) {
-		fprintf(stderr, "Error opening audio device %d\n", errno);
-		fprintf(stderr, "Please check your libao settings and try again\n");
-		return -1;
-	} else {
-		ao_close(device);
-		device = NULL;
-	}
 
 	memset(&raop_cbs, 0, sizeof(raop_cbs));
 	raop_cbs.cls = &options;
@@ -575,8 +489,6 @@ main(int argc, char *argv[])
 
 	raop_stop(raop);
 	raop_destroy(raop);
-
-	ao_shutdown();
 
 	jack_client_close (jack_client);
 	exit (0);
