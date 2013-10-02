@@ -48,43 +48,43 @@
 #define max(x,y) (((x)>(y)) ? (x) : (y))
 #define min(x,y) (((x)<(y)) ? (x) : (y))
 
-typedef struct {
+ typedef struct {
 	char apname[56];
 	char password[56];
 	unsigned short port;
 	char hwaddr[6];
 
-} shairplay_options_t;
+ } shairplay_options_t;
 
-typedef struct {
+ typedef struct {
 	float volume;
 
-} shairplay_session_t;
+ } shairplay_session_t;
 
-jack_ringbuffer_t *rb;
+ jack_ringbuffer_t *rb;
 
-jack_port_t *jack_output_port1, *jack_output_port2;
-jack_client_t *jack_client;
+ jack_port_t *jack_output_port1, *jack_output_port2;
+ jack_client_t *jack_client;
 
 
-static int running;
+ static int running;
 
 #ifndef WIN32
 
 #include <signal.h>
-static void
-signal_handler(int sig)
-{
+ static void
+ signal_handler(int sig)
+ {
 	switch (sig) {
-	case SIGINT:
-	case SIGTERM:
+		case SIGINT:
+		case SIGTERM:
 		running = 0;
 		break;
 	}
-}
-static void
-init_signals(void)
-{
+ }
+ static void
+ init_signals(void)
+ {
 	struct sigaction sigact;
 
 	sigact.sa_handler = signal_handler;
@@ -92,14 +92,14 @@ init_signals(void)
 	sigact.sa_flags = 0;
 	sigaction(SIGINT, &sigact, NULL);
 	sigaction(SIGTERM, &sigact, NULL);
-}
+ }
 
 #endif
 
 
-static int
-parse_hwaddr(const char *str, char *hwaddr, int hwaddrlen)
-{
+ static int
+ parse_hwaddr(const char *str, char *hwaddr, int hwaddrlen)
+ {
 	int slen, i;
 
 	slen = 3*hwaddrlen-1;
@@ -122,109 +122,87 @@ parse_hwaddr(const char *str, char *hwaddr, int hwaddrlen)
 		hwaddr[i] = (char) strtol(str+(i*3), NULL, 16);
 	}
 	return 0;
-}
+ }
 
 #define SAMPLE_MAX_16BIT  32768.0f
 
-void sample_move_dS_s16(jack_default_audio_sample_t* dst, char *src, jack_nframes_t nsamples, unsigned long src_skip) 
-{
+ void sample_move_dS_s16(jack_default_audio_sample_t* dst, char *src, jack_nframes_t nsamples, unsigned long src_skip) 
+ {
 	/* ALERT: signed sign-extension portability !!! */
 	while (nsamples--) {
 		*dst = (*((short *) src)) / SAMPLE_MAX_16BIT;
 		dst++;
 		src += src_skip;
 	}
-}	
+ }	
 
-
-/**
- * The process callback for this JACK application is called in a
- * special realtime thread once for each audio cycle.
- *
- * This client follows a simple rule: when the JACK transport is
- * running, copy the input port to the output.  When it stops, exit.
- */
-
-int
-process (jack_nframes_t nframes, void *arg)
-{   
-    shairplay_session_t *session = (shairplay_session_t*)arg;
+ int
+ process (jack_nframes_t nframes, void *arg)
+ {   
+	shairplay_session_t *session = (shairplay_session_t*)arg;
 //	shairplay_session_t *session = arg;
 
 	jack_default_audio_sample_t *out1, *out2;
-	
+
 	out1 = (jack_default_audio_sample_t*)jack_port_get_buffer (jack_output_port1, nframes);
 	out2 = (jack_default_audio_sample_t*)jack_port_get_buffer (jack_output_port2, nframes);
 
 	jack_nframes_t nframes_left = nframes;
-//	short tmp[2];
-//	int nframe = 0;
 	int wrotebytes = 0;
 
-
-//	printf("nframes_left = %d, space = %d\n", nframes_left, jack_ringbuffer_read_space(rb));
-
 	if (jack_ringbuffer_read_space(rb) == 0) {
-    
+
 		// just write silence
 		memset(out1, 0, nframes * sizeof(jack_default_audio_sample_t));
 		memset(out2, 0, nframes * sizeof(jack_default_audio_sample_t));	
 	} else {
-	// 	while (jack_ringbuffer_read_space(rb) >= 4 && nframes_left > 0) { //if there is a free space to write and 4 bytes in buffer exist
-	// 		jack_ringbuffer_read(rb, (void *)&tmp, 4);
-	// 		out1[nframe] = tmp[0] / 32767.0;
-	// 		out2[nframe] = tmp[1] / 32767.0;
-	// 		nframe++;
-	// 		nframes_left--;
-	// //W		jack_ringbuffer_read_advance(rb, 4);
-	// 	}
 
-	  jack_ringbuffer_data_t rb_data[2];
+		jack_ringbuffer_data_t rb_data[2];
 
+		jack_ringbuffer_get_read_vector(rb, rb_data);
+
+		while (nframes_left > 0 && rb_data[0].len > 4) {
+
+			jack_nframes_t towrite_frames = (rb_data[0].len) / (sizeof(short) * 2);
+			towrite_frames = min(towrite_frames, nframes_left);
+
+			sample_move_dS_s16(out1 + (nframes - nframes_left), (char *) rb_data[0].buf, towrite_frames, sizeof(short) * 2);
+			sample_move_dS_s16(out2 + (nframes - nframes_left), (char *) rb_data[0].buf + sizeof(short), towrite_frames, sizeof(short) * 2);
+
+
+			wrotebytes = towrite_frames * sizeof(short) * 2;
+			nframes_left -= towrite_frames;
+
+			jack_ringbuffer_read_advance(rb, wrotebytes);
 			jack_ringbuffer_get_read_vector(rb, rb_data);
-			
-			while (nframes_left > 0 && rb_data[0].len > 4) {
-		
-				jack_nframes_t towrite_frames = (rb_data[0].len) / (sizeof(short) * 2);
-				towrite_frames = min(towrite_frames, nframes_left);
-			
-				sample_move_dS_s16(out1 + (nframes - nframes_left), (char *) rb_data[0].buf, towrite_frames, sizeof(short) * 2);
-				sample_move_dS_s16(out2 + (nframes - nframes_left), (char *) rb_data[0].buf + sizeof(short), towrite_frames, sizeof(short) * 2);
+		}
 
-
-				wrotebytes = towrite_frames * sizeof(short) * 2;
-				nframes_left -= towrite_frames;
-				
-				jack_ringbuffer_read_advance(rb, wrotebytes);
-				jack_ringbuffer_get_read_vector(rb, rb_data);
-			}
-
-			if (nframes_left > 0) {
+		if (nframes_left > 0) {
 				// write silence
-				memset(out1 + (nframes - nframes_left), 0, (nframes_left) * sizeof(jack_default_audio_sample_t));
-				memset(out2 + (nframes - nframes_left), 0, (nframes_left) * sizeof(jack_default_audio_sample_t));		
-			}
+			memset(out1 + (nframes - nframes_left), 0, (nframes_left) * sizeof(jack_default_audio_sample_t));
+			memset(out2 + (nframes - nframes_left), 0, (nframes_left) * sizeof(jack_default_audio_sample_t));		
+		}
 
 	}
 
 	return 0;
-}
+ }
 
 /**
  * JACK calls this shutdown_callback if the server ever shuts down or
  * decides to disconnect the client.
  */
-void
-jack_shutdown (void *arg)
-{
+ void
+ jack_shutdown (void *arg)
+ {
 	exit (1);
-}
+ }
 
 
 
-static void *
-audio_init(void *cls, int bits, int channels, int samplerate)
-{
+ static void *
+ audio_init(void *cls, int bits, int channels, int samplerate)
+ {
 	shairplay_session_t *session;
 	shairplay_options_t *options = cls;
 
@@ -240,9 +218,7 @@ audio_init(void *cls, int bits, int channels, int samplerate)
 
 	session->volume = 1.0f;
 
-	rb = jack_ringbuffer_create(65536);
-
-	printf("rb pointer = %p\n", rb);
+	rb = jack_ringbuffer_create(1048576);
 
 	memset(rb->buf, 0, rb->size);
 
@@ -250,7 +226,7 @@ audio_init(void *cls, int bits, int channels, int samplerate)
 	jack_client = jack_client_open (client_name, jack_options, &jack_status, server_name);
 	if (jack_client == NULL) {
 		fprintf (stderr, "jack_client_open() failed, "
-			 "status = 0x%2.0x\n", jack_status);
+			"status = 0x%2.0x\n", jack_status);
 		if (jack_status & JackServerFailed) {
 			fprintf (stderr, "Unable to connect to JACK server\n");
 		}
@@ -265,40 +241,40 @@ audio_init(void *cls, int bits, int channels, int samplerate)
 	}
 
 	/* tell the JACK server to call `process()' whenever
-	   there is work to be done.
+		 there is work to be done.
 	*/
 
-	jack_set_process_callback (jack_client, process, &session);
+		 jack_set_process_callback (jack_client, process, &session);
 
 	/* tell the JACK server to call `jack_shutdown()' if
-	   it ever shuts down, either entirely, or if it
-	   just decides to stop calling us.
+		 it ever shuts down, either entirely, or if it
+		 just decides to stop calling us.
 	*/
 
-	jack_on_shutdown (jack_client, jack_shutdown, 0);
+		 jack_on_shutdown (jack_client, jack_shutdown, 0);
 
 	/* create two ports */
 
-	jack_output_port1 = jack_port_register (jack_client, "output1",
-					  JACK_DEFAULT_AUDIO_TYPE,
-					  JackPortIsOutput, 0);
+		 jack_output_port1 = jack_port_register (jack_client, "output1",
+			JACK_DEFAULT_AUDIO_TYPE,
+			JackPortIsOutput, 0);
 
-	jack_output_port2 = jack_port_register (jack_client, "output2",
-					  JACK_DEFAULT_AUDIO_TYPE,
-					  JackPortIsOutput, 0);
+		 jack_output_port2 = jack_port_register (jack_client, "output2",
+			JACK_DEFAULT_AUDIO_TYPE,
+			JackPortIsOutput, 0);
 
-	if ((jack_output_port1 == NULL) || (jack_output_port2 == NULL)) {
-		fprintf(stderr, "no more JACK ports available\n");
-		exit (1);
-	}
+		 if ((jack_output_port1 == NULL) || (jack_output_port2 == NULL)) {
+			fprintf(stderr, "no more JACK ports available\n");
+			exit (1);
+		 }
 
 	/* Tell the JACK server that we are ready to roll.  Our
 	 * process() callback will start running now. */
 
-	if (jack_activate (jack_client)) {
-		fprintf (stderr, "cannot activate client");
-		exit (1);
-	}
+		 if (jack_activate (jack_client)) {
+			fprintf (stderr, "cannot activate client");
+			exit (1);
+		 }
 
 	/* Connect the ports.  You can't do this before the client is
 	 * activated, because we can't make connections to clients
@@ -307,25 +283,25 @@ audio_init(void *cls, int bits, int channels, int samplerate)
 	 * "input" to the backend, and capture ports are "output" from
 	 * it.
 	 */
- 	
-	ports = jack_get_ports (jack_client, NULL, NULL,
-				JackPortIsPhysical|JackPortIsInput);
-	if (ports == NULL) {
+
+	 ports = jack_get_ports (jack_client, NULL, NULL,
+		JackPortIsPhysical|JackPortIsInput);
+	 if (ports == NULL) {
 		fprintf(stderr, "no physical playback ports\n");
 		exit (1);
-	}
+	 }
 
-	if (jack_connect (jack_client, jack_port_name (jack_output_port1), ports[0])) {
+	 if (jack_connect (jack_client, jack_port_name (jack_output_port1), ports[0])) {
 		fprintf (stderr, "cannot connect output ports\n");
-	}
+	 }
 
-	if (jack_connect (jack_client, jack_port_name (jack_output_port2), ports[1])) {
+	 if (jack_connect (jack_client, jack_port_name (jack_output_port2), ports[1])) {
 		fprintf (stderr, "cannot connect output ports\n");
-	}
+	 }
 
-	jack_free (ports);
-    
-    /* install a signal handler to properly quits jack client */
+	 jack_free (ports);
+
+		/* install a signal handler to properly quits jack client */
 // #ifdef WIN32
 // 	signal(SIGINT, signal_handler);
 //     signal(SIGABRT, signal_handler);
@@ -337,159 +313,158 @@ audio_init(void *cls, int bits, int channels, int samplerate)
 // 	signal(SIGINT, signal_handler);
 // #endif
 	//---jack---
-	fprintf(stderr, "Jack initialized\n");
+	 fprintf(stderr, "Jack initialized\n");
 
-	return session;
-}
-
-
-static void
-audio_process(void *cls, void *opaque, char *buffer, int buflen)
-{
-	shairplay_session_t *session = opaque;
-
-	jack_ringbuffer_write (rb, (void *) (buffer), buflen);
-
-}
-
-static void
-audio_destroy(void *cls, void *opaque)
-{
-	shairplay_session_t *session = opaque;
-
-	free(session);
-}
-
-static void
-audio_set_volume(void *cls, void *opaque, float volume)
-{
-	shairplay_session_t *session = opaque;
-	session->volume = pow(10.0, 0.05*volume);
-}
-
-static int
-parse_options(shairplay_options_t *opt, int argc, char *argv[])
-{
-	const char default_hwaddr[] = { 0x48, 0x5d, 0x60, 0x7c, 0xee, 0x22 };
-
-	char *path = argv[0];
-	char *arg;
-
-	/* Set default values for apname and port */
-	strncpy(opt->apname, "Shairplay", sizeof(opt->apname)-1);
-	opt->port = 5000;
-	memcpy(opt->hwaddr, default_hwaddr, sizeof(opt->hwaddr));
-
-	while ((arg = *++argv)) {
-		if (!strcmp(arg, "-a")) {
-			strncpy(opt->apname, *++argv, sizeof(opt->apname)-1);
-		} else if (!strncmp(arg, "--apname=", 9)) {
-			strncpy(opt->apname, arg+9, sizeof(opt->apname)-1);
-		} else if (!strcmp(arg, "-p")) {
-			strncpy(opt->password, *++argv, sizeof(opt->password)-1);
-		} else if (!strncmp(arg, "--password=", 11)) {
-			strncpy(opt->password, arg+11, sizeof(opt->password)-1);
-		} else if (!strcmp(arg, "-o")) {
-			opt->port = atoi(*++argv);
-		} else if (!strncmp(arg, "--server_port=", 14)) {
-			opt->port = atoi(arg+14);
-		} else if (!strncmp(arg, "--hwaddr=", 9)) {
-			if (parse_hwaddr(arg+9, opt->hwaddr, sizeof(opt->hwaddr))) {
-				fprintf(stderr, "Invalid format given for hwaddr, aborting...\n");
-				fprintf(stderr, "Please use hwaddr format: 01:45:89:ab:cd:ef\n");
-				return 1;
-			}
-		} else if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
-			fprintf(stderr, "Shairplay version %s\n", VERSION);
-			fprintf(stderr, "Usage: %s [OPTION...]\n", path);
-			fprintf(stderr, "\n");
-			fprintf(stderr, "  -a, --apname=AirPort            Sets Airport name\n");
-			fprintf(stderr, "  -p, --password=secret           Sets password\n");
-			fprintf(stderr, "  -o, --server_port=5000          Sets port for RAOP service\n");
-			fprintf(stderr, "      --hwaddr=address            Sets the MAC address, useful if running multiple instances\n");
-			fprintf(stderr, "  -h, --help                      This help\n");
-			fprintf(stderr, "\n");
-			return 1;
-		}
+	 return session;
 	}
 
-	return 0;
-}
+
+	static void
+	audio_process(void *cls, void *opaque, char *buffer, int buflen)
+	{
+		shairplay_session_t *session = opaque;
+
+		jack_ringbuffer_write (rb, buffer, buflen);
+	}
+
+	static void
+	audio_destroy(void *cls, void *opaque)
+	{
+		shairplay_session_t *session = opaque;
+
+		free(session);
+	}
+
+	static void
+	audio_set_volume(void *cls, void *opaque, float volume)
+	{
+		shairplay_session_t *session = opaque;
+		session->volume = pow(10.0, 0.05*volume);
+	}
+
+	static int
+	parse_options(shairplay_options_t *opt, int argc, char *argv[])
+	{
+		const char default_hwaddr[] = { 0x48, 0x5d, 0x60, 0x7c, 0xee, 0x22 };
+
+		char *path = argv[0];
+		char *arg;
+
+	/* Set default values for apname and port */
+		strncpy(opt->apname, "Shairplay", sizeof(opt->apname)-1);
+		opt->port = 5000;
+		memcpy(opt->hwaddr, default_hwaddr, sizeof(opt->hwaddr));
+
+		while ((arg = *++argv)) {
+			if (!strcmp(arg, "-a")) {
+				strncpy(opt->apname, *++argv, sizeof(opt->apname)-1);
+			} else if (!strncmp(arg, "--apname=", 9)) {
+				strncpy(opt->apname, arg+9, sizeof(opt->apname)-1);
+			} else if (!strcmp(arg, "-p")) {
+				strncpy(opt->password, *++argv, sizeof(opt->password)-1);
+			} else if (!strncmp(arg, "--password=", 11)) {
+				strncpy(opt->password, arg+11, sizeof(opt->password)-1);
+			} else if (!strcmp(arg, "-o")) {
+				opt->port = atoi(*++argv);
+			} else if (!strncmp(arg, "--server_port=", 14)) {
+				opt->port = atoi(arg+14);
+			} else if (!strncmp(arg, "--hwaddr=", 9)) {
+				if (parse_hwaddr(arg+9, opt->hwaddr, sizeof(opt->hwaddr))) {
+					fprintf(stderr, "Invalid format given for hwaddr, aborting...\n");
+					fprintf(stderr, "Please use hwaddr format: 01:45:89:ab:cd:ef\n");
+					return 1;
+				}
+			} else if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
+				fprintf(stderr, "Shairplay version %s\n", VERSION);
+				fprintf(stderr, "Usage: %s [OPTION...]\n", path);
+				fprintf(stderr, "\n");
+				fprintf(stderr, "  -a, --apname=AirPort            Sets Airport name\n");
+				fprintf(stderr, "  -p, --password=secret           Sets password\n");
+				fprintf(stderr, "  -o, --server_port=5000          Sets port for RAOP service\n");
+				fprintf(stderr, "      --hwaddr=address            Sets the MAC address, useful if running multiple instances\n");
+				fprintf(stderr, "  -h, --help                      This help\n");
+				fprintf(stderr, "\n");
+				return 1;
+			}
+		}
+
+		return 0;
+	}
 
 
 //--jack---
 
 
-int
-main(int argc, char *argv[])
-{
-	shairplay_options_t options;
+	int
+	main(int argc, char *argv[])
+	{
+		shairplay_options_t options;
 
-	dnssd_t *dnssd;
-	raop_t *raop;
-	raop_callbacks_t raop_cbs;
-	char *password = NULL;
+		dnssd_t *dnssd;
+		raop_t *raop;
+		raop_callbacks_t raop_cbs;
+		char *password = NULL;
 
-	int error;
+		int error;
 
 #ifndef WIN32
-	init_signals();
+		init_signals();
 #endif
 
-	memset(&options, 0, sizeof(options));
-	if (parse_options(&options, argc, argv)) {
-		return 0;
-	}
+		memset(&options, 0, sizeof(options));
+		if (parse_options(&options, argc, argv)) {
+			return 0;
+		}
 
 
-	memset(&raop_cbs, 0, sizeof(raop_cbs));
-	raop_cbs.cls = &options;
-	raop_cbs.audio_init = audio_init;
-	raop_cbs.audio_process = audio_process;
-	raop_cbs.audio_destroy = audio_destroy;
-	raop_cbs.audio_set_volume = audio_set_volume;
+		memset(&raop_cbs, 0, sizeof(raop_cbs));
+		raop_cbs.cls = &options;
+		raop_cbs.audio_init = audio_init;
+		raop_cbs.audio_process = audio_process;
+		raop_cbs.audio_destroy = audio_destroy;
+		raop_cbs.audio_set_volume = audio_set_volume;
 
-	raop = raop_init_from_keyfile(10, &raop_cbs, "airport.key", NULL);
-	if (raop == NULL) {
-		fprintf(stderr, "Could not initialize the RAOP service\n");
-		return -1;
-	}
+		raop = raop_init_from_keyfile(10, &raop_cbs, "airport.key", NULL);
+		if (raop == NULL) {
+			fprintf(stderr, "Could not initialize the RAOP service\n");
+			return -1;
+		}
 
-	if (strlen(options.password)) {
-		password = options.password;
-	}
-	raop_set_log_level(raop, RAOP_LOG_DEBUG);
-	raop_start(raop, &options.port, options.hwaddr, sizeof(options.hwaddr), password);
+		if (strlen(options.password)) {
+			password = options.password;
+		}
+		raop_set_log_level(raop, RAOP_LOG_DEBUG);
+		raop_start(raop, &options.port, options.hwaddr, sizeof(options.hwaddr), password);
 
-	error = 0;
-	dnssd = dnssd_init(&error);
-	if (error) {
-		fprintf(stderr, "ERROR: Could not initialize dnssd library!\n");
-		fprintf(stderr, "------------------------------------------\n");
-		fprintf(stderr, "You could try the following resolutions based on your OS:\n");
-		fprintf(stderr, "Windows: Try installing http://support.apple.com/kb/DL999\n");
-		fprintf(stderr, "Debian/Ubuntu: Try installing libavahi-compat-libdnssd-dev package\n");
-		raop_destroy(raop);
-		return -1;
-	}
+		error = 0;
+		dnssd = dnssd_init(&error);
+		if (error) {
+			fprintf(stderr, "ERROR: Could not initialize dnssd library!\n");
+			fprintf(stderr, "------------------------------------------\n");
+			fprintf(stderr, "You could try the following resolutions based on your OS:\n");
+			fprintf(stderr, "Windows: Try installing http://support.apple.com/kb/DL999\n");
+			fprintf(stderr, "Debian/Ubuntu: Try installing libavahi-compat-libdnssd-dev package\n");
+			raop_destroy(raop);
+			return -1;
+		}
 
-	dnssd_register_raop(dnssd, options.apname, options.port, options.hwaddr, sizeof(options.hwaddr), 0);
+		dnssd_register_raop(dnssd, options.apname, options.port, options.hwaddr, sizeof(options.hwaddr), 0);
 
-	running = 1;
-	while (running) {
+		running = 1;
+		while (running) {
 #ifndef WIN32
-		sleep(1);
+			sleep(1);
 #else
-		Sleep(1000);
+			Sleep(1000);
 #endif
+		}
+
+		dnssd_unregister_raop(dnssd); 
+		dnssd_destroy(dnssd);
+
+		raop_stop(raop);
+		raop_destroy(raop);
+
+		jack_client_close (jack_client);
+		exit (0);
 	}
-
-	dnssd_unregister_raop(dnssd); 
-	dnssd_destroy(dnssd);
-
-	raop_stop(raop);
-	raop_destroy(raop);
-
-	jack_client_close (jack_client);
-	exit (0);
-}
