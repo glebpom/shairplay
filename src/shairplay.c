@@ -58,11 +58,20 @@ typedef struct {
 
 	int buffering;
 	int buflen;
+
+	int write_position;
+	int read_position;
+
 	char buffer[8192];
 
 	float volume;
 } shairplay_session_t;
 
+jack_port_t *jack_output_port1, *jack_output_port2;
+jack_client_t *jack_client;
+
+char tmpbuf[8196];
+int tmpbuflen;
 
 static int running;
 
@@ -121,6 +130,64 @@ parse_hwaddr(const char *str, char *hwaddr, int hwaddrlen)
 	return 0;
 }
 
+/**
+ * The process callback for this JACK application is called in a
+ * special realtime thread once for each audio cycle.
+ *
+ * This client follows a simple rule: when the JACK transport is
+ * running, copy the input port to the output.  When it stops, exit.
+ */
+
+int
+process (jack_nframes_t nframes, void *arg)
+{   
+     shairplay_session_t *session = (shairplay_session_t*)arg;
+	 jack_default_audio_sample_t *out1, *out2;
+	
+	 out1 = (jack_default_audio_sample_t*)jack_port_get_buffer (jack_output_port1, nframes);
+	 out2 = (jack_default_audio_sample_t*)jack_port_get_buffer (jack_output_port2, nframes);
+
+     int i = 0;
+     int min_size; 
+     int tj = 0;
+     int maxsize = nframes;
+     tmpbuflen = 0;
+
+     char tmp[8192];
+
+     int length = 0;
+     int position = 0;
+ 	 for (position = session->read_position; position < session->read_position + 8192; position++){
+		printf("position = %d, write_position = %d\n", position, session->write_position);
+ 	 	if (position == session->write_position) {
+ 	 		break;
+ 	 	};
+ 	 	tmp[i++] = session->buffer[position%8192];
+ 	 	length++;
+ 	 }
+	 session->read_position = (session->read_position + length) % 8192;
+
+ 	 for (i=0;i<length/4; i++){
+ 	 	short *tmpshort = (unsigned short *)&tmp[i*4];
+     	out1[i] = tmpshort[0] / 32767.0;
+     	out2[i] = tmpshort[1] / 32767.0;
+
+	 } 
+    
+	return 0;      
+}
+
+/**
+ * JACK calls this shutdown_callback if the server ever shuts down or
+ * decides to disconnect the client.
+ */
+void
+jack_shutdown (void *arg)
+{
+	exit (1);
+}
+
+
 static ao_device *
 audio_open_device(shairplay_options_t *opt, int bits, int channels, int samplerate)
 {
@@ -166,6 +233,109 @@ audio_init(void *cls, int bits, int channels, int samplerate)
 	session = calloc(1, sizeof(shairplay_session_t));
 	assert(session);
 
+
+	const char **ports;
+	const char *client_name = "shairplay";
+	const char *server_name = NULL;
+	jack_options_t jack_options = JackNullOption;
+	jack_status_t jack_status;
+
+
+	jack_client = jack_client_open (client_name, jack_options, &jack_status, server_name);
+	if (jack_client == NULL) {
+		fprintf (stderr, "jack_client_open() failed, "
+			 "status = 0x%2.0x\n", jack_status);
+		if (jack_status & JackServerFailed) {
+			fprintf (stderr, "Unable to connect to JACK server\n");
+		}
+		exit (1);
+	}
+	if (jack_status & JackServerStarted) {
+		fprintf (stderr, "JACK server started\n");
+	}
+	if (jack_status & JackNameNotUnique) {
+		client_name = jack_get_client_name(jack_client);
+		fprintf (stderr, "unique name `%s' assigned\n", client_name);
+	}
+
+	/* tell the JACK server to call `process()' whenever
+	   there is work to be done.
+	*/
+
+	jack_set_process_callback (jack_client, process, &session);
+
+	/* tell the JACK server to call `jack_shutdown()' if
+	   it ever shuts down, either entirely, or if it
+	   just decides to stop calling us.
+	*/
+
+	jack_on_shutdown (jack_client, jack_shutdown, 0);
+
+	/* create two ports */
+
+	jack_output_port1 = jack_port_register (jack_client, "output1",
+					  JACK_DEFAULT_AUDIO_TYPE,
+					  JackPortIsOutput, 0);
+
+	jack_output_port2 = jack_port_register (jack_client, "output2",
+					  JACK_DEFAULT_AUDIO_TYPE,
+					  JackPortIsOutput, 0);
+
+	if ((jack_output_port1 == NULL) || (jack_output_port2 == NULL)) {
+		fprintf(stderr, "no more JACK ports available\n");
+		exit (1);
+	}
+
+	/* Tell the JACK server that we are ready to roll.  Our
+	 * process() callback will start running now. */
+
+	if (jack_activate (jack_client)) {
+		fprintf (stderr, "cannot activate client");
+		exit (1);
+	}
+
+	/* Connect the ports.  You can't do this before the client is
+	 * activated, because we can't make connections to clients
+	 * that aren't running.  Note the confusing (but necessary)
+	 * orientation of the driver backend ports: playback ports are
+	 * "input" to the backend, and capture ports are "output" from
+	 * it.
+	 */
+ 	
+	ports = jack_get_ports (jack_client, NULL, NULL,
+				JackPortIsPhysical|JackPortIsInput);
+	if (ports == NULL) {
+		fprintf(stderr, "no physical playback ports\n");
+		exit (1);
+	}
+
+	if (jack_connect (jack_client, jack_port_name (jack_output_port1), ports[0])) {
+		fprintf (stderr, "cannot connect output ports\n");
+	}
+
+	if (jack_connect (jack_client, jack_port_name (jack_output_port2), ports[1])) {
+		fprintf (stderr, "cannot connect output ports\n");
+	}
+
+	jack_free (ports);
+
+	jack_set_buffer_size(jack_client, sizeof(tmpbuf)/sizeof(jack_nframes_t));
+    
+    /* install a signal handler to properly quits jack client */
+// #ifdef WIN32
+// 	signal(SIGINT, signal_handler);
+//     signal(SIGABRT, signal_handler);
+// 	signal(SIGTERM, signal_handler);
+// #else
+// 	signal(SIGQUIT, signal_handler);
+// 	signal(SIGTERM, signal_handler);
+// 	signal(SIGHUP, signal_handler);
+// 	signal(SIGINT, signal_handler);
+// #endif
+	//---jack---
+	fprintf(stderr, "Jack initialized\n");
+
+
 	session->device = audio_open_device(options, bits, channels, samplerate);
 	if (session->device == NULL) {
 		printf("Error opening device %d\n", errno);
@@ -174,6 +344,8 @@ audio_init(void *cls, int bits, int channels, int samplerate)
 
 	session->buffering = 1;
 	session->volume = 1.0f;
+	session->write_position = 0;
+	session->read_position = 0;
 	return session;
 }
 
@@ -181,57 +353,66 @@ static int
 audio_output(shairplay_session_t *session, const void *buffer, int buflen)
 {
 	short *shortbuf;
-	char tmpbuf[4096];
-	int tmpbuflen, i;
+	int i;
 
 	tmpbuflen = (buflen > sizeof(tmpbuf)) ? sizeof(tmpbuf) : buflen;
 	memcpy(tmpbuf, buffer, tmpbuflen);
-	if (ao_is_big_endian()) {
-		for (i=0; i<tmpbuflen/2; i++) {
-			char tmpch = tmpbuf[i*2];
-			tmpbuf[i*2] = tmpbuf[i*2+1];
-			tmpbuf[i*2+1] = tmpch;
-		}
-	}
+
 	shortbuf = (short *)tmpbuf;
 	for (i=0; i<tmpbuflen/2; i++) {
 		shortbuf[i] = shortbuf[i] * session->volume;
 	}
-	ao_play(session->device, tmpbuf, tmpbuflen);
+//	ao_play(session->device, tmpbuf, tmpbuflen);
 	return tmpbuflen;
 }
 
+
 static void
-audio_process(void *cls, void *opaque, const void *buffer, int buflen)
+audio_process(void *cls, void *opaque, char *buffer, int buflen)
 {
 	shairplay_session_t *session = opaque;
 	int processed;
 
-	if (session->buffering) {
-		printf("Buffering...\n");
-		if (session->buflen+buflen < sizeof(session->buffer)) {
-			memcpy(session->buffer+session->buflen, buffer, buflen);
-			session->buflen += buflen;
-			return;
-		}
-		session->buffering = 0;
-		printf("Finished buffering...\n");
+	//постоянно записываем аудио в кольцевой буффер
 
-		processed = 0;
-		while (processed < session->buflen) {
-			processed += audio_output(session,
-			                          session->buffer+processed,
-			                          session->buflen-processed);
-		}
-		session->buflen = 0;
+	int position; 
+	int i=0;
+	for (position = session->write_position; position < session->write_position + buflen; position++){
+		session->buffer[position % 8192] = buffer[i++];
 	}
+	session->write_position = (session->write_position + buflen) % 8192;
+	fprintf(stderr, "new position = %d\n", session->write_position);
 
-	processed = 0;
-	while (processed < buflen) {
-		processed += audio_output(session,
-		                          buffer+processed,
-		                          buflen-processed);
-	}
+
+	// if (session->buffering) {
+	// 	//buffering = 1 только в самом начале
+	// 	printf("Buffering...\n");
+	// 	if (session->buflen+buflen < sizeof(session->buffer)) {
+	// 		//дописываем в буфер новые данные
+	// 		memcpy(session->buffer+session->buflen, buffer, buflen);
+	// 		session->buflen += buflen;
+	// 		return;
+	// 	}
+	// 	//помечаем, что дописали
+	// 	session->buffering = 0;
+	// 	printf("Finished buffering...\n");
+
+	// 	processed = 0;
+	// 	while (processed < session->buflen) {
+	// 		processed += audio_output(session,
+	// 		                          session->buffer+processed,
+	// 		                          session->buflen-processed);
+	// 	}
+	// 	session->buflen = 0;
+	// }
+
+	// processed = 0;
+	// while (processed < buflen) {
+	// 	processed += audio_output(session,
+	// 	                          buffer+processed,
+	// 	                          buflen-processed);
+	// }
+
 }
 
 static void
@@ -309,35 +490,6 @@ parse_options(shairplay_options_t *opt, int argc, char *argv[])
 }
 
 
-//---jack---
-
-jack_port_t *jack_output_port1, *jack_output_port2;
-jack_client_t *jack_client;
-
-/**
- * The process callback for this JACK application is called in a
- * special realtime thread once for each audio cycle.
- *
- * This client follows a simple rule: when the JACK transport is
- * running, copy the input port to the output.  When it stops, exit.
- */
-
-int
-process (jack_nframes_t nframes, void *arg)
-{   
-	return 0;      
-}
-
-/**
- * JACK calls this shutdown_callback if the server ever shuts down or
- * decides to disconnect the client.
- */
-void
-jack_shutdown (void *arg)
-{
-	exit (1);
-}
-
 //--jack---
 
 
@@ -362,107 +514,6 @@ main(int argc, char *argv[])
 	if (parse_options(&options, argc, argv)) {
 		return 0;
 	}
-
-	//---jack---
-
-	const char **ports;
-	const char *client_name = "shairplay";
-	const char *server_name = NULL;
-	jack_options_t jack_options = JackNullOption;
-	jack_status_t jack_status;
-
-
-	jack_client = jack_client_open (client_name, jack_options, &jack_status, server_name);
-	if (jack_client == NULL) {
-		fprintf (stderr, "jack_client_open() failed, "
-			 "status = 0x%2.0x\n", jack_status);
-		if (jack_status & JackServerFailed) {
-			fprintf (stderr, "Unable to connect to JACK server\n");
-		}
-		exit (1);
-	}
-	if (jack_status & JackServerStarted) {
-		fprintf (stderr, "JACK server started\n");
-	}
-	if (jack_status & JackNameNotUnique) {
-		client_name = jack_get_client_name(jack_client);
-		fprintf (stderr, "unique name `%s' assigned\n", client_name);
-	}
-
-	/* tell the JACK server to call `process()' whenever
-	   there is work to be done.
-	*/
-
-	jack_set_process_callback (jack_client, process, 0);
-
-	/* tell the JACK server to call `jack_shutdown()' if
-	   it ever shuts down, either entirely, or if it
-	   just decides to stop calling us.
-	*/
-
-	jack_on_shutdown (jack_client, jack_shutdown, 0);
-
-	/* create two ports */
-
-	jack_output_port1 = jack_port_register (jack_client, "output1",
-					  JACK_DEFAULT_AUDIO_TYPE,
-					  JackPortIsOutput, 0);
-
-	jack_output_port2 = jack_port_register (jack_client, "output2",
-					  JACK_DEFAULT_AUDIO_TYPE,
-					  JackPortIsOutput, 0);
-
-	if ((jack_output_port1 == NULL) || (jack_output_port2 == NULL)) {
-		fprintf(stderr, "no more JACK ports available\n");
-		exit (1);
-	}
-
-	/* Tell the JACK server that we are ready to roll.  Our
-	 * process() callback will start running now. */
-
-	if (jack_activate (jack_client)) {
-		fprintf (stderr, "cannot activate client");
-		exit (1);
-	}
-
-	/* Connect the ports.  You can't do this before the client is
-	 * activated, because we can't make connections to clients
-	 * that aren't running.  Note the confusing (but necessary)
-	 * orientation of the driver backend ports: playback ports are
-	 * "input" to the backend, and capture ports are "output" from
-	 * it.
-	 */
- 	
-	ports = jack_get_ports (jack_client, NULL, NULL,
-				JackPortIsPhysical|JackPortIsInput);
-	if (ports == NULL) {
-		fprintf(stderr, "no physical playback ports\n");
-		exit (1);
-	}
-
-	if (jack_connect (jack_client, jack_port_name (jack_output_port1), ports[0])) {
-		fprintf (stderr, "cannot connect output ports\n");
-	}
-
-	if (jack_connect (jack_client, jack_port_name (jack_output_port2), ports[1])) {
-		fprintf (stderr, "cannot connect output ports\n");
-	}
-
-	jack_free (ports);
-    
-    /* install a signal handler to properly quits jack client */
-#ifdef WIN32
-	signal(SIGINT, signal_handler);
-    signal(SIGABRT, signal_handler);
-	signal(SIGTERM, signal_handler);
-#else
-	signal(SIGQUIT, signal_handler);
-	signal(SIGTERM, signal_handler);
-	signal(SIGHUP, signal_handler);
-	signal(SIGINT, signal_handler);
-#endif
-	//---jack---
-	fprintf(stderr, "Jack initialized\n");
 
 
 	ao_initialize();
