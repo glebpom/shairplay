@@ -126,11 +126,11 @@
 
 #define SAMPLE_MAX_16BIT  32768.0f
 
- void sample_move_dS_s16(jack_default_audio_sample_t* dst, char *src, jack_nframes_t nsamples, unsigned long src_skip) 
+ void sample_move_dS_s16_volume(jack_default_audio_sample_t* dst, char *src, jack_nframes_t nsamples, unsigned long src_skip, float volume) 
  {
 	/* ALERT: signed sign-extension portability !!! */
 	while (nsamples--) {
-		*dst = (*((short *) src)) / SAMPLE_MAX_16BIT;
+		*dst = (*((short *) src)) / SAMPLE_MAX_16BIT * volume;
 		dst++;
 		src += src_skip;
 	}
@@ -150,7 +150,7 @@
 	jack_nframes_t nframes_left = nframes;
 	int wrotebytes = 0;
 
-	if (jack_ringbuffer_read_space(rb) == 0) {
+	if (jack_ringbuffer_read_space(rb) < 100000) {
 
 		// just write silence
 		memset(out1, 0, nframes * sizeof(jack_default_audio_sample_t));
@@ -166,8 +166,8 @@
 			jack_nframes_t towrite_frames = (rb_data[0].len) / (sizeof(short) * 2);
 			towrite_frames = min(towrite_frames, nframes_left);
 
-			sample_move_dS_s16(out1 + (nframes - nframes_left), (char *) rb_data[0].buf, towrite_frames, sizeof(short) * 2);
-			sample_move_dS_s16(out2 + (nframes - nframes_left), (char *) rb_data[0].buf + sizeof(short), towrite_frames, sizeof(short) * 2);
+			sample_move_dS_s16_volume(out1 + (nframes - nframes_left), (char *) rb_data[0].buf, towrite_frames, sizeof(short) * 2, session->volume);
+			sample_move_dS_s16_volume(out2 + (nframes - nframes_left), (char *) rb_data[0].buf + sizeof(short), towrite_frames, sizeof(short) * 2, session->volume);
 
 
 			wrotebytes = towrite_frames * sizeof(short) * 2;
@@ -212,7 +212,6 @@
 	jack_options_t jack_options = JackNullOption;
 	jack_status_t jack_status;
 
-	printf("Size of shairplay session = %d\n", sizeof(shairplay_session_t));
 	session = calloc(1, sizeof(shairplay_session_t));
 	assert(session);
 
@@ -244,7 +243,7 @@
 		 there is work to be done.
 	*/
 
-		 jack_set_process_callback (jack_client, process, &session);
+		 jack_set_process_callback (jack_client, process, session);
 
 	/* tell the JACK server to call `jack_shutdown()' if
 		 it ever shuts down, either entirely, or if it
@@ -340,6 +339,7 @@
 	{
 		shairplay_session_t *session = opaque;
 		session->volume = pow(10.0, 0.05*volume);
+		fprintf(stderr, "Volume = %f\d", session->volume);
 	}
 
 	static int
