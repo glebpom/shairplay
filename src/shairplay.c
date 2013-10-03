@@ -57,11 +57,10 @@
  } shairplay_options_t;
 
  typedef struct {
-	float volume;
-
+	 float volume;
+	 jack_ringbuffer_t *rb;
  } shairplay_session_t;
 
- jack_ringbuffer_t *rb;
 
  jack_port_t *jack_output_port1, *jack_output_port2;
  jack_client_t *jack_client;
@@ -96,6 +95,7 @@
 
 #endif
 
+shairplay_session_t *session;
 
  static int
  parse_hwaddr(const char *str, char *hwaddr, int hwaddrlen)
@@ -140,7 +140,6 @@
  process (jack_nframes_t nframes, void *arg)
  {   
 	shairplay_session_t *session = (shairplay_session_t*)arg;
-//	shairplay_session_t *session = arg;
 
 	jack_default_audio_sample_t *out1, *out2;
 
@@ -150,7 +149,8 @@
 	jack_nframes_t nframes_left = nframes;
 	int wrotebytes = 0;
 
-	if (jack_ringbuffer_read_space(rb) < 100000) {
+
+	if (jack_ringbuffer_read_space(session->rb) < 100000) {
 
 		// just write silence
 		memset(out1, 0, nframes * sizeof(jack_default_audio_sample_t));
@@ -159,7 +159,7 @@
 
 		jack_ringbuffer_data_t rb_data[2];
 
-		jack_ringbuffer_get_read_vector(rb, rb_data);
+		jack_ringbuffer_get_read_vector(session->rb, rb_data);
 
 		while (nframes_left > 0 && rb_data[0].len > 4) {
 
@@ -173,8 +173,8 @@
 			wrotebytes = towrite_frames * sizeof(short) * 2;
 			nframes_left -= towrite_frames;
 
-			jack_ringbuffer_read_advance(rb, wrotebytes);
-			jack_ringbuffer_get_read_vector(rb, rb_data);
+			jack_ringbuffer_read_advance(session->rb, wrotebytes);
+			jack_ringbuffer_get_read_vector(session->rb, rb_data);
 		}
 
 		if (nframes_left > 0) {
@@ -198,16 +198,11 @@
 	exit (1);
  }
 
-
-
- static void *
- audio_init(void *cls, int bits, int channels, int samplerate)
- {
+static void * initialize_jack(char *client_name){
 	shairplay_session_t *session;
-	shairplay_options_t *options = cls;
+//	shairplay_options_t *options = cls;
 
 	const char **ports;
-	const char *client_name = "shairplay";
 	const char *server_name = NULL;
 	jack_options_t jack_options = JackNullOption;
 	jack_status_t jack_status;
@@ -217,9 +212,9 @@
 
 	session->volume = 1.0f;
 
-	rb = jack_ringbuffer_create(1048576);
+	session->rb = jack_ringbuffer_create(1048576);
 
-	memset(rb->buf, 0, rb->size);
+	memset(session->rb->buf, 0, session->rb->size);
 
 
 	jack_client = jack_client_open (client_name, jack_options, &jack_status, server_name);
@@ -315,6 +310,30 @@
 	 fprintf(stderr, "Jack initialized\n");
 
 	 return session;
+}
+
+static void destroy_jack(shairplay_session_t *session){
+		fprintf(stderr, "Closing jack...");
+		jack_client_close (jack_client);
+
+		fprintf(stderr, "Freeing memory...");
+
+		jack_ringbuffer_free (session->rb);
+
+		free(session);
+
+		fprintf(stderr, "Done...");
+}
+
+
+ static void *
+ audio_init(void *cls, int bits, int channels, int samplerate)
+ {
+ 		assert(bits == 16);
+ 		assert(channels == 2);
+ 		assert(samplerate == 44100);
+
+ 		return session;
 	}
 
 
@@ -323,36 +342,36 @@
 	{
 		shairplay_session_t *session = opaque;
 
-		jack_ringbuffer_write (rb, buffer, buflen);
+		jack_ringbuffer_write (session->rb, buffer, buflen);
 	}
 
 	static void
 	audio_destroy(void *cls, void *opaque)
 	{
-		shairplay_session_t *session = opaque;
-
-		free(session);
+		sleep(20000);
+		//?
 	}
+
+
 
 	static void
 	audio_set_volume(void *cls, void *opaque, float volume)
 	{
 		shairplay_session_t *session = opaque;
 		session->volume = pow(10.0, 0.05*volume);
-		fprintf(stderr, "Volume = %f\d", session->volume);
 	}
 
 	static int
 	parse_options(shairplay_options_t *opt, int argc, char *argv[])
 	{
 		const char default_hwaddr[] = { 0x48, 0x5d, 0x60, 0x7c, 0xee, 0x22 };
-
 		char *path = argv[0];
 		char *arg;
 
 	/* Set default values for apname and port */
 		strncpy(opt->apname, "Shairplay", sizeof(opt->apname)-1);
 		opt->port = 5000;
+
 		memcpy(opt->hwaddr, default_hwaddr, sizeof(opt->hwaddr));
 
 		while ((arg = *++argv)) {
@@ -416,6 +435,7 @@
 			return 0;
 		}
 
+		session = initialize_jack(options.apname);
 
 		memset(&raop_cbs, 0, sizeof(raop_cbs));
 		raop_cbs.cls = &options;
@@ -459,12 +479,14 @@
 #endif
 		}
 
+		destroy_jack(session);
+
 		dnssd_unregister_raop(dnssd); 
 		dnssd_destroy(dnssd);
 
 		raop_stop(raop);
 		raop_destroy(raop);
 
-		jack_client_close (jack_client);
+
 		exit (0);
 	}
